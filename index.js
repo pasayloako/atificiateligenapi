@@ -9,7 +9,7 @@ const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'selovasx2024';
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 const SYSTEM_PROMPT = fs.existsSync(path.join(__dirname, 'system-prompt.txt'))
   ? fs.readFileSync(path.join(__dirname, 'system-prompt.txt'), 'utf8')
