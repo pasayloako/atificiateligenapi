@@ -28,7 +28,7 @@ function isAdmin(req) { return Boolean(ADMIN_TOKEN && req.get('x-admin-token') =
 function requireAdmin(req, res, next) { if (!isAdmin(req)) return res.status(401).json({ error: 'Admin authentication required.' }); next(); }
 function ownedChat(userId, chatId) { const chat = store.chats[chatId]; return chat && chat.userId === userId ? chat : null; }
 function chatView(chat) { return { id: chat.id, userId: chat.userId, title: chat.title, createdAt: chat.createdAt, updatedAt: chat.updatedAt }; }
-function messageView(message) { return { ...message, canDelete: message.from === 'admin' }; }
+function messageView(message) { return { ...message, canDelete: message.from === 'admin' || message.from === 'ai' }; }
 function chatMessages(chatId) { return Object.values(store.messages).filter(m => m.chatId === chatId).sort((a, b) => a.ts - b.ts); }
 function createChat(userId, title = 'New chat') { const now = Date.now(); const chat = { id: id('chat'), userId, title: clean(title, 100) || 'New chat', createdAt: now, updatedAt: now }; store.chats[chat.id] = chat; persist(); return chat; }
 function addMessage(chat, from, text, extra = {}) { const message = { id: id('msg'), chatId: chat.id, from, text: clean(text), ts: Date.now(), ...extra }; store.messages[message.id] = message; chat.updatedAt = message.ts; persist(); return message; }
@@ -67,11 +67,11 @@ app.delete('/api/chats/:chatId', requireUser, (req, res) => { const chat = owned
 app.get('/api/chats/:chatId/messages', requireUser, (req, res) => { const chat = ownedChat(req.user.id, req.params.chatId); if (!chat) return res.status(404).json({ error: 'Chat not found.' }); res.json({ chat: chatView(chat), messages: chatMessages(chat.id).map(messageView) }); });
 
 async function officialGemini(prompt, history) {
-  const contents = history.slice(-20).map(m => ({ role: m.from === 'admin' ? 'model' : 'user', parts: [{ text: m.text }] }));
+  const contents = history.slice(-20).map(m => ({ role: m.from === 'user' ? 'user' : 'model', parts: [{ text: m.text }] }));
   contents.push({ role: 'user', parts: [{ text: prompt }] });
   const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`;
-  const response = await axios.post(url, { system_instruction: { parts: [{ text: SYSTEM_PROMPT }] }, contents }, { timeout: 45000 });
+  const response = await axios.post(url, { systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }, contents }, { timeout: 45000 });
   return response.data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim() || '';
 }
 
@@ -90,7 +90,7 @@ app.post('/api/chats/:chatId/messages', requireUser, async (req, res) => {
 
 app.get('/api/admin/conversations', requireAdmin, (_req, res) => { const chats = Object.values(store.chats).sort((a, b) => b.updatedAt - a.updatedAt).map(c => ({ ...chatView(c), user: publicUser(store.users[c.userId]), messages: chatMessages(c.id).map(messageView) })); res.json({ chats }); });
 app.post('/api/admin/chats/:chatId/messages', requireAdmin, (req, res) => { const chat = store.chats[req.params.chatId]; const text = clean(req.body?.text); if (!chat) return res.status(404).json({ error: 'Chat not found.' }); if (!text) return res.status(400).json({ error: 'Reply text is required.' }); res.status(201).json({ message: messageView(addMessage(chat, 'admin', text, { name: 'Admin' })) }); });
-app.delete('/api/admin/messages/:messageId', requireAdmin, (req, res) => { const message = store.messages[req.params.messageId]; if (!message) return res.status(404).json({ error: 'Message not found.' }); if (message.from !== 'admin') return res.status(403).json({ error: 'Admins can only unsend their own messages.' }); delete store.messages[message.id]; const chat = store.chats[message.chatId]; if (chat) chat.updatedAt = Date.now(); persist(); res.status(204).end(); });
+app.delete('/api/admin/messages/:messageId', requireAdmin, (req, res) => { const message = store.messages[req.params.messageId]; if (!message) return res.status(404).json({ error: 'Message not found.' }); if (!['admin', 'ai'].includes(message.from)) return res.status(403).json({ error: 'Admins can only unsend admin or AI messages.' }); delete store.messages[message.id]; const chat = store.chats[message.chatId]; if (chat) chat.updatedAt = Date.now(); persist(); res.status(204).end(); });
 
 const frontendPath = path.join(__dirname, 'index.html');
 app.use(express.static(path.join(__dirname)));
