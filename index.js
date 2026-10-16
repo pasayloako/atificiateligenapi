@@ -5,7 +5,6 @@ const crypto = require('crypto');
 const fs = require('fs');
 const cors = require('cors');
 const session = require('express-session');
-const { OAuth2Client } = require('google-auth-library');
 const axios = require('axios');
 
 const app = express();
@@ -15,10 +14,6 @@ const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 const SYSTEM_PROMPT = fs.existsSync(path.join(__dirname, 'system-prompt.txt'))
   ? fs.readFileSync(path.join(__dirname, 'system-prompt.txt'), 'utf8')
   : 'You are NovaGPT, a helpful professional assistant. Answer in clear English.';
-const google = process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET
-  ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, process.env.GOOGLE_REDIRECT_URI)
-  : null;
-
 function emptyStore() { return { users: {}, chats: {}, messages: {} }; }
 function loadStore() { try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch (_) { return emptyStore(); } }
 let store = loadStore();
@@ -26,9 +21,9 @@ for (const key of ['users', 'chats', 'messages']) store[key] ||= {};
 function persist() { fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2)); }
 function id(prefix) { return `${prefix}_${crypto.randomUUID()}`; }
 function clean(value, max = 4000) { return typeof value === 'string' ? value.trim().slice(0, max) : ''; }
-function publicUser(user) { return user ? { id: user.id, googleId: user.googleId, name: user.name, email: user.email, picture: user.picture } : null; }
+function publicUser(user) { return user ? { id: user.id, name: user.name, createdAt: user.createdAt, lastLoginAt: user.lastLoginAt } : null; }
 function getUser(req) { return req.session.userId ? store.users[req.session.userId] : null; }
-function requireUser(req, res, next) { const user = getUser(req); if (!user) return res.status(401).json({ error: 'Google login required.' }); req.user = user; next(); }
+function requireUser(req, res, next) { const user = getUser(req); if (!user) return res.status(401).json({ error: 'Please log in with your name and password.' }); req.user = user; next(); }
 function isAdmin(req) { return Boolean(ADMIN_TOKEN && req.get('x-admin-token') === ADMIN_TOKEN); }
 function requireAdmin(req, res, next) { if (!isAdmin(req)) return res.status(401).json({ error: 'Admin authentication required.' }); next(); }
 function ownedChat(userId, chatId) { const chat = store.chats[chatId]; return chat && chat.userId === userId ? chat : null; }
@@ -37,6 +32,10 @@ function messageView(message) { return { ...message, canDelete: message.from ===
 function chatMessages(chatId) { return Object.values(store.messages).filter(m => m.chatId === chatId).sort((a, b) => a.ts - b.ts); }
 function createChat(userId, title = 'New chat') { const now = Date.now(); const chat = { id: id('chat'), userId, title: clean(title, 100) || 'New chat', createdAt: now, updatedAt: now }; store.chats[chat.id] = chat; persist(); return chat; }
 function addMessage(chat, from, text, extra = {}) { const message = { id: id('msg'), chatId: chat.id, from, text: clean(text), ts: Date.now(), ...extra }; store.messages[message.id] = message; chat.updatedAt = message.ts; persist(); return message; }
+function normalizeName(value) { return clean(value, 80).replace(/\s+/g, ' '); }
+function nameKey(value) { return normalizeName(value).toLowerCase(); }
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) { return { salt, hash: crypto.scryptSync(password, salt, 64).toString('hex') }; }
+function passwordMatches(password, user) { const actual = crypto.scryptSync(password, user.passwordSalt, 64); const expected = Buffer.from(user.passwordHash, 'hex'); return actual.length === expected.length && crypto.timingSafeEqual(actual, expected); }
 
 app.set('trust proxy', 1);
 app.use(cors({ origin: process.env.CORS_ORIGIN || true, credentials: true }));
@@ -44,21 +43,20 @@ app.use(express.json({ limit: '64kb' }));
 app.use(session({ secret: process.env.SESSION_SECRET || 'change-this-session-secret', resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 1000 * 60 * 60 * 24 * 30 } }));
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'novagpt-api', aiProvider: process.env.GEMINI_API_KEY ? 'gemini-api' : 'pasted-gemini-adapter', time: new Date().toISOString() }));
-app.get('/api/me', (req, res) => res.json({ user: publicUser(getUser(req)), googleConfigured: Boolean(google) }));
-app.get('/auth/google', (req, res) => {
-  if (!google) return res.status(503).send('Google login is not configured. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.');
-  const state = crypto.randomBytes(20).toString('hex'); req.session.oauthState = state;
-  res.redirect(google.generateAuthUrl({ access_type: 'offline', scope: ['openid', 'email', 'profile'], prompt: 'select_account', state }));
+app.get('/api/me', (req, res) => res.json({ user: publicUser(getUser(req)) }));
+app.post('/api/signup', (req, res) => {
+  const name = normalizeName(req.body?.name); const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (name.length < 2 || name.length > 80) return res.status(400).json({ error: 'Name must be between 2 and 80 characters.' });
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+  if (Object.values(store.users).some(u => nameKey(u.name) === nameKey(name))) return res.status(409).json({ error: 'That name is already registered. Please choose another.' });
+  const credentials = hashPassword(password); const user = { id: id('user'), name, passwordSalt: credentials.salt, passwordHash: credentials.hash, createdAt: Date.now(), lastLoginAt: Date.now() };
+  store.users[user.id] = user; req.session.userId = user.id; persist(); res.status(201).json({ user: publicUser(user) });
 });
-app.get('/auth/google/callback', async (req, res) => {
-  try {
-    if (!google || !req.query.code || req.query.state !== req.session.oauthState) return res.status(400).send('Invalid Google login request.');
-    const { tokens } = await google.getToken(req.query.code); const ticket = await google.verifyIdToken({ idToken: tokens.id_token, audience: process.env.GOOGLE_CLIENT_ID });
-    const p = ticket.getPayload(); if (!p?.sub || !p.email || p.email_verified === false) return res.status(403).send('A verified Google account is required.');
-    const userId = Object.values(store.users).find(u => u.googleId === p.sub)?.id || id('user');
-    store.users[userId] = { id: userId, googleId: p.sub, name: clean(p.name || p.email.split('@')[0], 100), email: p.email, picture: p.picture || '', createdAt: store.users[userId]?.createdAt || Date.now(), lastLoginAt: Date.now() };
-    req.session.userId = userId; delete req.session.oauthState; persist(); res.redirect('/');
-  } catch (error) { console.error('Google login failed:', error.message); res.status(500).send('Google login failed. Check the OAuth redirect URL and credentials.'); }
+app.post('/api/login', (req, res) => {
+  const name = normalizeName(req.body?.name); const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  const user = Object.values(store.users).find(u => nameKey(u.name) === nameKey(name));
+  if (!user || !user.passwordHash || !passwordMatches(password, user)) return res.status(401).json({ error: 'Incorrect name or password.' });
+  user.lastLoginAt = Date.now(); req.session.userId = user.id; persist(); res.json({ user: publicUser(user) });
 });
 app.post('/api/logout', (req, res) => req.session.destroy(() => res.json({ ok: true })));
 
