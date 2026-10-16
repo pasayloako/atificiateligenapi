@@ -92,6 +92,11 @@ app.get('/api/admin/conversations', requireAdmin, (_req, res) => { const chats =
 app.post('/api/admin/chats/:chatId/messages', requireAdmin, (req, res) => { const chat = store.chats[req.params.chatId]; const text = clean(req.body?.text); if (!chat) return res.status(404).json({ error: 'Chat not found.' }); if (!text) return res.status(400).json({ error: 'Reply text is required.' }); res.status(201).json({ message: messageView(addMessage(chat, 'admin', text, { name: 'Admin' })) }); });
 app.delete('/api/admin/messages/:messageId', requireAdmin, (req, res) => { const message = store.messages[req.params.messageId]; if (!message) return res.status(404).json({ error: 'Message not found.' }); if (message.from !== 'admin') return res.status(403).json({ error: 'Admins can only unsend their own messages.' }); delete store.messages[message.id]; const chat = store.chats[message.chatId]; if (chat) chat.updatedAt = Date.now(); persist(); res.status(204).end(); });
 
+const frontendPath = path.join(__dirname, 'index.html');
 app.use(express.static(path.join(__dirname)));
-app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+app.get('*', (req, res) => {
+  if (fs.existsSync(frontendPath)) return res.sendFile(frontendPath);
+  if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'API route not found.' });
+  res.status(404).send('NovaGPT API is running. Upload index.html and adminsecret.html to enable the website pages.');
+});
 app.listen(PORT, '0.0.0.0', () => console.log(`NovaGPT API listening on ${PORT}`));
