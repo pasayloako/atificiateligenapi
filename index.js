@@ -6,7 +6,7 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 10000;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'selovasx2024';
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://novagpt.xo.je';
 const conversations = new Map();
 
 app.set('trust proxy', 1);
