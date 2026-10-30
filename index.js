@@ -9,7 +9,7 @@ const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'selovasx2024';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 const SYSTEM_PROMPT = fs.existsSync(path.join(__dirname, 'system-prompt.txt'))
   ? fs.readFileSync(path.join(__dirname, 'system-prompt.txt'), 'utf8')
@@ -68,16 +68,28 @@ app.get('/api/chats/:chatId/messages', requireUser, (req, res) => { const chat =
 
 async function officialGemini(prompt, history) {
   const contents = history.slice(-20).map(m => ({ role: m.from === 'user' ? 'user' : 'model', parts: [{ text: m.text }] }));
-  contents.push({ role: 'user', parts: [{ text: prompt }] });
+  contents.push({ role: 'user', parts: [{ text: `${prompt}\n\nIf you provide code, return a complete runnable answer. Do not omit sections or stop in the middle of a file.` }] });
   const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`;
-  const response = await axios.post(url, { systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }, contents }, { timeout: 45000 });
-  return response.data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim() || '';
+  const request = () => axios.post(url, { systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }, contents, generationConfig: { maxOutputTokens: 8192, temperature: 0.25 } }, { timeout: 60000 });
+  let response = await request();
+  let candidate = response.data?.candidates?.[0];
+  let text = candidate?.content?.parts?.map(p => p.text || '').join('') || '';
+  let finishReason = candidate?.finishReason;
+  for (let continuation = 0; continuation < 2 && finishReason === 'MAX_TOKENS'; continuation += 1) {
+    contents.push({ role: 'model', parts: [{ text }] });
+    contents.push({ role: 'user', parts: [{ text: 'Continue exactly from where you stopped. Return only the missing continuation, with no explanation and no repeated content.' }] });
+    response = await request();
+    candidate = response.data?.candidates?.[0];
+    text += candidate?.content?.parts?.map(p => p.text || '').join('') || '';
+    finishReason = candidate?.finishReason;
+  }
+  return text.trim();
 }
 
 let pastedConfig = { cookie: null, snlm0e: null, fsid: null, conversation_id: '', response_id: '', choice_id: '' };
 async function pastedSync(method = 'GET', data = null) { const url = process.env.UNOFFICIAL_GEMINI_FIREBASE_URL || 'https://puru-tools-default-rtdb.firebaseio.com/sessions/google.json'; if (method === 'GET') { const r = await axios.get(url, { timeout: 15000 }); const d = r.data || {}; pastedConfig = { ...pastedConfig, cookie: d.cookie_string || d.cookie, snlm0e: d.snlm0e, fsid: d.fsid, conversation_id: d.conversation_id || '', response_id: d.response_id || '', choice_id: d.choice_id || '' }; } else await axios.patch(url, { ...data, last_updated: new Date().toISOString() }, { timeout: 15000 }); }
-function parsePastedResponse(raw) { let result = { text: '', convId: '', respId: '', choiceId: '' }; for (const line of String(raw).split('\n')) { if (!line.trim().startsWith('[[')) continue; try { for (const part of JSON.parse(line.trim())) if (part[0] === 'wrb.fr') { const inner = JSON.parse(part[2]); if (inner?.[4]) for (const c of inner[4]) if (c?.[1]?.[0]) result.text = c[1][0]; if (inner?.[1]) { result.convId = inner[1][0]; result.respId = inner[1][1]; } if (inner?.[4]?.[0]?.[0]) result.choiceId = inner[4][0][0]; } } catch (_) {} } return result; }
+function parsePastedResponse(raw) { let result = { text: '', convId: '', respId: '', choiceId: '' }; for (const line of String(raw).split('\n')) { if (!line.trim().startsWith('[[')) continue; try { for (const part of JSON.parse(line.trim())) if (part[0] === 'wrb.fr') { const inner = JSON.parse(part[2]); if (inner?.[4]) for (const c of inner[4]) if (c?.[1]?.[0]) { const candidate = String(c[1][0]); if (candidate.length > result.text.length) result.text = candidate; } if (inner?.[1]) { result.convId = inner[1][0]; result.respId = inner[1][1]; } if (inner?.[4]?.[0]?.[0]) result.choiceId = inner[4][0][0]; } } catch (_) {} } return result; }
 async function pastedGemini(prompt) { await pastedSync('GET'); const englishPrompt = `${SYSTEM_PROMPT}\n\nRespond in clear professional English only.\n\nUser question: ${prompt}`; const url = 'https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate'; const params = new URLSearchParams({ bl: process.env.GEMINI_BL || 'boq_assistant-bard-web-server_20260208.13_p0', _reqid: Math.floor(Math.random() * 900000), rt: 'c', 'f.sid': pastedConfig.fsid }); const reqData = [null, JSON.stringify([[englishPrompt, 0, null, null, null, null, 0], ['id'], [pastedConfig.conversation_id, pastedConfig.response_id, pastedConfig.choice_id, null, null, null, null, null, null, ''], ''])]; const r = await axios.post(`${url}?${params}`, `f.req=${encodeURIComponent(JSON.stringify(reqData))}&at=${encodeURIComponent(pastedConfig.snlm0e)}&`, { headers: { Cookie: pastedConfig.cookie, 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 'User-Agent': 'Mozilla/5.0', Referer: 'https://gemini.google.com/' }, timeout: 45000 }); const parsed = parsePastedResponse(r.data); if (!parsed.text) throw new Error('Empty unofficial Gemini response'); await pastedSync('PATCH', { cookie_string: r.headers['set-cookie']?.join('; ') || pastedConfig.cookie, conversation_id: parsed.convId, response_id: parsed.respId, choice_id: parsed.choiceId }); return parsed.text; }
 async function askAI(prompt, history) { if (process.env.GEMINI_API_KEY) return officialGemini(prompt, history); return pastedGemini(prompt); }
 
